@@ -43,6 +43,7 @@ class SimpleMixSplit {
     seed <<= 32;
     seed |= random();
   }
+  explicit SimpleMixSplit(uint64_t s) : seed(s) {}
 
   inline static uint64_t murmur64(uint64_t h) {
     h ^= h >> 33;
@@ -59,5 +60,6 @@ class SimpleMixSplit {
 };
 
 }
+
 
 #endif  // CUCKOO_FILTER_HASHUTIL_H_
