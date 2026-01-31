@@ -33,6 +33,7 @@
 #include <omp.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "Int.h"
@@ -256,6 +257,150 @@ bool loadDPBinary(const std::string& fn){
         if((++n & 0xFFFFF) == 0) std::cout<<"\rLoaded "<<n<<std::flush;
     }
     std::cout<<"\rLoaded "<<n<<" traps (done)\n";
+    return true;
+}
+
+// ─── Table cache (DP_table + st_used + bloom) ─────────────────────────────────
+#pragma pack(push,1)
+struct TableMetaHeader{
+    char     magic[8];      // "MK1TAB1"
+    uint32_t version;       // 1
+    uint32_t dp_bits;
+    uint32_t k;
+    uint32_t reserved;
+    uint64_t traps;
+    uint64_t cap;
+    uint64_t usedCount;
+    uint64_t bloomBytes;
+    uint64_t bloomSeed;
+    uint8_t  A[32];
+    uint8_t  B[32];
+};
+#pragma pack(pop)
+
+static inline void IntTo32Bytes(const Int& v,uint8_t out[32]){
+    Int tmp; intCopy(tmp,v); tmp.Get32Bytes(out);
+}
+static inline void BytesToInt32(const uint8_t in[32],Int& out){
+    out.Set32Bytes(const_cast<unsigned char*>(in)); // Int API не const-friendly
+}
+static inline uint64_t computeBloomSeed(const Int& A,const Int& B,
+                                        unsigned dp_bits,unsigned k,
+                                        uint64_t traps,size_t cap){
+    uint64_t x = 0xB10FB10FB10FB10FULL;
+    x ^= splitmix64(IntLow64(A));
+    x ^= splitmix64(IntLow64(B));
+    x ^= splitmix64((uint64_t(dp_bits) << 32) ^ uint64_t(k));
+    x ^= splitmix64(traps);
+    x ^= splitmix64(uint64_t(cap));
+    return splitmix64(x);
+}
+
+static bool saveTableCache(const std::string& tablePath,
+                           const Int& A,const Int& B,
+                           unsigned dp_bits,unsigned k,
+                           uint64_t traps,uint64_t bloomSeed){
+    const std::string metaPath = tablePath + ".meta";
+    TableMetaHeader h{};
+    std::memcpy(h.magic,"MK1TAB1",7);
+    h.magic[7]=0;
+    h.version   = 1;
+    h.dp_bits   = dp_bits;
+    h.k         = k;
+    h.traps     = traps;
+    h.cap       = dp.cap;
+    h.usedCount = dp.size.load(std::memory_order_relaxed);
+    h.bloomBytes= bloom->SizeInBytes();
+    h.bloomSeed = bloomSeed;
+    IntTo32Bytes(A,h.A);
+    IntTo32Bytes(B,h.B);
+
+    std::ofstream f(metaPath,std::ios::binary|std::ios::trunc);
+    if(!f){ std::cerr<<"[ERR] open "<<metaPath<<"\n"; return false; }
+    f.write(reinterpret_cast<char*>(&h),sizeof(h));
+
+    const size_t bitBytes = (dp.cap + 7) / 8;
+    std::vector<uint8_t> used(bitBytes);
+
+#pragma omp parallel for schedule(static)
+    for(size_t b=0;b<bitBytes;++b){
+        uint8_t v=0;
+        const size_t base=b*8;
+        for(int j=0;j<8;++j){
+            const size_t idx=base + size_t(j);
+            if(idx < dp.cap &&
+               dp.st_used[idx].load(std::memory_order_relaxed))
+                v |= uint8_t(1u<<j);
+        }
+        used[b]=v;
+    }
+
+    f.write(reinterpret_cast<const char*>(used.data()),used.size());
+    f.write(reinterpret_cast<const char*>(bloom->data()),h.bloomBytes);
+
+    if(!f){ std::cerr<<"[ERR] write "<<metaPath<<"\n"; return false; }
+    std::cout<<"Saved table cache: "<<metaPath
+             <<" | used="<<h.usedCount
+             <<" | bloom="<<humanBytes(h.bloomBytes)<<"\n";
+    return true;
+}
+
+static bool loadTableCache(const std::string& tablePath,
+                           const Int& A,const Int& B,
+                           unsigned dp_bits,unsigned k,
+                           uint64_t traps,uint64_t bloomSeed){
+    const std::string metaPath = tablePath + ".meta";
+    std::ifstream f(metaPath,std::ios::binary);
+    if(!f){ std::cerr<<"[ERR] missing "<<metaPath<<"\n"; return false; }
+
+    TableMetaHeader h{};
+    f.read(reinterpret_cast<char*>(&h),sizeof(h));
+    if(!f){ std::cerr<<"[ERR] read header "<<metaPath<<"\n"; return false; }
+    if(std::memcmp(h.magic,"MK1TAB1",7)!=0 || h.version!=1){
+        std::cerr<<"[ERR] bad meta magic/version\n"; return false;
+    }
+    if(h.cap != dp.cap){
+        std::cerr<<"[ERR] meta cap mismatch (meta "<<h.cap<<" vs need "<<dp.cap<<")\n"; return false;
+    }
+    if(h.dp_bits != dp_bits || h.k != k){
+        std::cerr<<"[ERR] meta dp_bits/k mismatch\n"; return false;
+    }
+    if(h.traps != traps){
+        std::cerr<<"[ERR] meta traps mismatch\n"; return false;
+    }
+    if(h.bloomBytes != bloom->SizeInBytes()){
+        std::cerr<<"[ERR] meta bloomBytes mismatch\n"; return false;
+    }
+    if(h.bloomSeed != bloomSeed){
+        std::cerr<<"[ERR] meta bloomSeed mismatch\n"; return false;
+    }
+    Int A0,B0; BytesToInt32(h.A,A0); BytesToInt32(h.B,B0);
+    if(!A0.IsEqual(&const_cast<Int&>(A)) || !B0.IsEqual(&const_cast<Int&>(B))){
+        std::cerr<<"[ERR] meta range mismatch\n"; return false;
+    }
+
+    const size_t bitBytes = (dp.cap + 7) / 8;
+    std::vector<uint8_t> used(bitBytes);
+    f.read(reinterpret_cast<char*>(used.data()),used.size());
+    if(!f){ std::cerr<<"[ERR] read st_used "<<metaPath<<"\n"; return false; }
+
+#pragma omp parallel for schedule(static)
+    for(size_t i=0;i<dp.cap;++i){
+        const uint8_t byte = used[i>>3];
+        const uint8_t v = (byte >> (i & 7)) & 1;
+        dp.st_used[i].store(v,std::memory_order_relaxed);
+        dp.st_lock[i].store(0,std::memory_order_relaxed);
+    }
+
+    f.read(reinterpret_cast<char*>(bloom->data()),h.bloomBytes);
+    if(!f){ std::cerr<<"[ERR] read bloom "<<metaPath<<"\n"; return false; }
+
+    dp.size.store(h.usedCount,std::memory_order_relaxed);
+    dpDone.store(std::min<uint64_t>(traps,h.usedCount),std::memory_order_relaxed);
+
+    std::cout<<"Loaded table cache: "<<metaPath
+             <<" | used="<<h.usedCount
+             <<" | bloom="<<humanBytes(h.bloomBytes)<<"\n";
     return true;
 }
 
@@ -549,6 +694,7 @@ int main(int argc,char** argv)
     /* ── CLI ── */
     Int A,B; uint64_t traps=0; unsigned bits=12; size_t ramGB=8;
     Point pub; unsigned k_user=0; bool saveDP=false, loadDP=false;
+    bool useTable=false, saveTable=false; std::string tablePath="dp_table.bin";
     std::string dpFile;
     for(int i=1;i<argc;++i){
         std::string a=argv[i];
@@ -564,6 +710,9 @@ int main(int argc,char** argv)
             char pc=h[1]; Int x; x.SetBase16((char*)h.substr(2).c_str());
             pub.x=x; pub.y=secp.GetY(x,pc=='2');
         }else if(a=="--save-dp"||a=="-s") saveDP=true;
+        else if(a=="--use-table"){ useTable=true; tablePath=argv[++i]; }
+        else if(a=="--save-table"){ saveTable=true; tablePath=argv[++i]; }
+        else if(a=="--table"){ tablePath=argv[++i]; }
         else if(a=="--load-dp"){ loadDP=true; dpFile=argv[++i]; }
         else{ std::cerr<<"Unknown "<<a<<'\n'; return 1; }
     }
@@ -586,9 +735,10 @@ int main(int argc,char** argv)
     size_t cap  = 1;
     while(cap < cap0) cap <<= 1;
 
-    dp.init("dp_table.bin",cap);
+    dp.init(tablePath,cap);
 
     size_t bloomBytes=size_t(traps*bloomFactor);
+    uint64_t bloomSeed = computeBloomSeed(A,B,bits,k,traps,cap);
     std::cout<<"\n=========== Phase-0: Data summary ==========\n";
     std::cout<<"DP table (SSD): "<<humanBytes(cap*sizeof(DPSlot))
              <<"  ( "<<traps<<" / "<<cap<<" slots, load "
@@ -596,7 +746,7 @@ int main(int argc,char** argv)
              <<double(traps)/cap*100<<"% )\n";
     std::cout<<"Bloom    (RAM): "<<humanBytes(bloomBytes)<<'\n';
 
-    bloom=new simd_bloom::SimdBlockFilterFixed<>(bloomBytes);
+    bloom=new simd_bloom::SimdBlockFilterFixed<>(bloomBytes, bloomSeed);
 
     unsigned th=std::max(1u,std::thread::hardware_concurrency());
     auto segs=splitRange(A,range,th);
@@ -604,26 +754,35 @@ int main(int argc,char** argv)
     buildJumpTable(k);
 
     // ─── Phase-1 ────────────────────────────────────────────────────────────
-    dp.enable_flush.store(false);            
-    std::cout<<"\n========== Phase-1: Building traps =========\n";
-    if(loadDP){
-        if(!loadDPBinary(dpFile)) return 1;
+    dp.enable_flush.store(false);
+    if(useTable){
+        std::cout<<"\n========== Phase-1: Reusing DP table =======\n";
+        if(!loadTableCache(tablePath,A,B,bits,k,traps,bloomSeed)) return 1;
     }else{
-        std::thread progress([&]{
-            while(dpDone.load()<traps){
-                std::cout<<"\rUnique traps: "<<dpDone<<'/'<<traps<<std::flush;
-                std::this_thread::sleep_for(std::chrono::milliseconds(250));
-            }
-            std::cout<<"\rUnique traps: "<<traps<<"/"<<traps<<" (done)\n";
-        });
+        std::cout<<"\n========== Phase-1: Building traps =========\n";
+        if(loadDP){
+            if(!loadDPBinary(dpFile)) return 1;
+        }else{
+            std::thread progress([&]{
+                while(dpDone.load()<traps){
+                    std::cout<<"\rUnique traps: "<<dpDone<<'/'<<traps<<std::flush;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                }
+                std::cout<<"\rUnique traps: "<<traps<<"/"<<traps<<" (done)\n";
+            });
 #pragma omp parallel for schedule(static)
-        for(unsigned t=0;t<th;++t)
-            buildDP_segment(segs[t],per,k,bits,
-                            splitmix64(0xABCDEF12345678ULL^t));
-        progress.join();
-        if(saveDP) saveDPBinary("DP.bin");
+            for(unsigned t=0;t<th;++t)
+                buildDP_segment(segs[t],per,k,bits,
+                                splitmix64(0xABCDEF12345678ULL^t));
+            progress.join();
+            if(saveDP) saveDPBinary("DP.bin");
+        }
+
+        dp.fullSync();
+        if(saveTable){
+            if(!saveTableCache(tablePath,A,B,bits,k,traps,bloomSeed)) return 1;
+        }
     }
-    dp.fullSync();                         
     dp.enable_flush.store(true);
 
     // ─── Phase-2 ────────────────────────────────────────────────────────────
@@ -680,3 +839,4 @@ int main(int argc,char** argv)
     delete bloom; dp.close();
     return 0;
 }
+
