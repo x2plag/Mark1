@@ -74,6 +74,22 @@ public:
     std::memset(raw, 0, bytes);
     directory_.reset(raw);
   }
+  explicit SimdBlockFilterFixed(uint64 bits, uint64 seed)
+      : bucket_count_(std::max<uint32>(1, static_cast<uint32>(bits / 256))),
+        directory_(nullptr, &std::free),
+        hasher_(seed)
+  {
+    if (!__builtin_cpu_supports("avx2"))
+      throw std::runtime_error("AVX2 doesn't work with this CPU");
+
+    const size_t bytes = static_cast<size_t>(bucket_count_) * sizeof(Bucket);
+    Bucket* raw = nullptr;
+    if (posix_memalign(reinterpret_cast<void**>(&raw), 64, bytes) != 0)
+      throw std::bad_alloc();
+    std::memset(raw, 0, bytes);
+    directory_.reset(raw);
+  }
+  
 
   [[nodiscard]] uint64 SizeInBytes() const noexcept {
     return static_cast<uint64>(bucket_count_) * sizeof(Bucket);
