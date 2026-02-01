@@ -764,11 +764,52 @@ int main(int argc,char** argv)
             if(!loadDPBinary(dpFile)) return 1;
         }else{
             std::thread progress([&]{
-                while(dpDone.load()<traps){
-                    std::cout<<"\rUnique traps: "<<dpDone<<'/'<<traps<<std::flush;
+                using clock = std::chrono::steady_clock;
+                auto t0      = clock::now();
+                auto lastT   = t0;
+                uint64_t lastCnt = 0;
+
+                while(true){
                     std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+                    uint64_t cur = dpDone.load(std::memory_order_relaxed);
+                    if(cur >= traps) break;
+
+                    auto nowT = clock::now();
+                    if(nowT - lastT < std::chrono::seconds(5))
+                        continue;
+
+                    double dt  = std::chrono::duration<double>(nowT - lastT).count();
+                    double tot = std::chrono::duration<double>(nowT - t0).count();
+                    uint64_t d = cur - lastCnt;
+
+                    double instRate = (dt  > 0.0) ? (double)d   / dt  : 0.0;   // traps/s
+                    double avgRate  = (tot > 0.0) ? (double)cur / tot : 0.0;   // traps/s
+                    double pct      = (traps > 0) ? (double)cur * 100.0 / (double)traps : 0.0;
+
+                    uint64_t etaSec = 0;
+                    if(avgRate > 0.0 && cur < traps){
+                        etaSec = (uint64_t)((double)(traps - cur) / avgRate);
+                    }
+                    uint64_t hh = etaSec / 3600;
+                    uint64_t mm = (etaSec / 60) % 60;
+                    uint64_t ss = etaSec % 60;
+
+                    std::ostringstream line;
+                    line << "\rUnique traps: " << cur << '/' << traps
+                         << " (" << std::fixed << std::setprecision(2) << pct << "%)"
+                         << " | " << std::fixed << std::setprecision(0) << instRate << " traps/s"
+                         << " | ETA: " << hh << ':' << std::setw(2) << std::setfill('0') << mm
+                         << ':' << std::setw(2) << ss << std::setfill(' ')
+                         << "        "; //
+
+                    std::cout << line.str() << std::flush;
+
+                    lastT = nowT;
+                    lastCnt = cur;
                 }
-                std::cout<<"\rUnique traps: "<<traps<<"/"<<traps<<" (done)\n";
+
+                std::cout << "\rUnique traps: " << traps << "/" << traps << " (done)\n";
             });
 #pragma omp parallel for schedule(static)
             for(unsigned t=0;t<th;++t)
@@ -839,4 +880,5 @@ int main(int argc,char** argv)
     delete bloom; dp.close();
     return 0;
 }
+
 
